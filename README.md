@@ -1,5 +1,3 @@
-## Handoff Brief: Rust Goal
-
 We’re trying to build a **Rust ingestion path using DuckDB** that behaves like a dynamic-schema JSON ingest engine.
 
 ### Problem We’re Solving
