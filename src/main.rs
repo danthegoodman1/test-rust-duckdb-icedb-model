@@ -217,7 +217,21 @@ fn query_first_optional_string(conn: &Connection, sql: &str) -> AppResult<Option
     Ok(None)
 }
 
+fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT count(*)::BIGINT
+         FROM information_schema.tables
+         WHERE table_name = ?"
+    )?;
+    let count: i64 = stmt.query_row([table], |r| r.get(0))?;
+    Ok(count > 0)
+}
+
 fn fetch_table_row_structure_json(conn: &Connection, table: &str) -> AppResult<Option<String>> {
+    if !table_exists(conn, table)? {
+        return Ok(None)
+    }
+
     let sql = format!(
         "SELECT json_group_structure(to_json(t)) FROM {} t",
         qident(table)
@@ -244,21 +258,26 @@ fn validate_batch_against_existing_table(
     Ok(merged_shape != existing_shape)
 }
 
-fn insert_raw_json_rows(conn: &Connection, table: &str, rows: &[Value]) -> AppResult<()> {
-    const INSERT_CHUNK_ROWS: usize = 500;
-    let table_q = qident(table);
-
-    for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
-        let values = chunk
-            .iter()
-            .map(|row| format!("(json({}))", qliteral(&row.to_string())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("INSERT INTO {} (payload) VALUES {}", table_q, values);
-        conn.execute_batch(&sql)?;
+fn shape_to_structure_json(shape: &JsonShape) -> Value {
+    match shape {
+        JsonShape::Unknown => Value::String("NULL".to_string()),
+        JsonShape::Bool => Value::String("BOOLEAN".to_string()),
+        JsonShape::BigInt => Value::String("BIGINT".to_string()),
+        JsonShape::Double => Value::String("DOUBLE".to_string()),
+        JsonShape::Varchar => Value::String("VARCHAR".to_string()),
+        JsonShape::Array(inner) => Value::Array(vec![shape_to_structure_json(inner)]),
+        JsonShape::Struct(fields) => {
+            let mut keys: Vec<_> = fields.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(field_shape) = fields.get(key) {
+                    out.insert(key.clone(), shape_to_structure_json(field_shape));
+                }
+            }
+            Value::Object(out)
+        }
     }
-
-    Ok(())
 }
 
 fn json_rows_to_payload_record_batch(rows: &[Value]) -> AppResult<RecordBatch> {
@@ -281,11 +300,27 @@ fn run_arrow_query_from_json_batch_chunked(
     chunk_size: usize,
     sql_with_arrow_union_source: &str,
 ) -> AppResult<Vec<RecordBatch>> {
+    let (_, params) = build_arrow_union_source_and_params(rows, chunk_size)?;
+    let mut stmt = conn.prepare(sql_with_arrow_union_source)?;
+    Ok(stmt.query_arrow(params_from_iter(params))?.collect())
+}
+
+fn build_arrow_union_source_and_params(rows: &[Value], chunk_size: usize) -> AppResult<(String, Vec<usize>)> {
     if chunk_size == 0 {
         return Err(invalid_input("chunk_size must be > 0").into())
     }
 
-    let mut params = Vec::<usize>::new();
+    let chunk_count = rows.chunks(chunk_size).len();
+    if chunk_count == 0 {
+        return Ok((String::new(), vec![]))
+    }
+
+    let union_source = (0..chunk_count)
+        .map(|_| "SELECT payload AS payload_text FROM arrow(?, ?)")
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+
+    let mut params = Vec::<usize>::with_capacity(chunk_count * 2);
     for chunk in rows.chunks(chunk_size) {
         let batch = json_rows_to_payload_record_batch(chunk)?;
         let [array_ptr, schema_ptr] = arrow_recordbatch_to_query_params(batch);
@@ -293,8 +328,28 @@ fn run_arrow_query_from_json_batch_chunked(
         params.push(schema_ptr);
     }
 
-    let mut stmt = conn.prepare(sql_with_arrow_union_source)?;
-    Ok(stmt.query_arrow(params_from_iter(params))?.collect())
+    Ok((union_source, params))
+}
+
+fn fetch_merged_json_structure_from_arrow_chunked(
+    conn: &Connection,
+    rows: &[Value],
+    chunk_size: usize,
+) -> AppResult<String> {
+    if rows.is_empty() {
+        return Ok("{}".to_string())
+    }
+
+    ensure_arrow_table_function(conn)?;
+    let (union_source, params) = build_arrow_union_source_and_params(rows, chunk_size)?;
+    let sql = format!(
+        "SELECT json_group_structure(json(payload_text)) FROM ({})",
+        union_source
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let structure: Option<String> = stmt.query_row(params_from_iter(params), |r| r.get(0))?;
+    Ok(structure.unwrap_or_else(|| "{}".to_string()))
 }
 
 fn ensure_arrow_table_function(conn: &Connection) -> AppResult<()> {
@@ -326,56 +381,68 @@ fn query_arrow_from_json_batch_chunked(
     chunk_size: usize,
 ) -> AppResult<Vec<RecordBatch>> {
     ensure_arrow_table_function(conn)?;
-    let chunk_count = rows.chunks(chunk_size).len();
-    if chunk_count == 0 {
+    let (union_source, _) = build_arrow_union_source_and_params(rows, chunk_size)?;
+    if union_source.is_empty() {
         return Ok(vec![])
     }
-
-    let union_source = (0..chunk_count)
-        .map(|_| "SELECT payload FROM arrow(?, ?)")
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
     let sql = format!(
         "SELECT parsed.*
-         FROM (SELECT from_json(json(payload), {}) AS parsed FROM ({}))",
+         FROM (SELECT from_json(json(payload_text), {}) AS parsed FROM ({}))",
         qliteral(merged_structure),
         union_source
     );
     run_arrow_query_from_json_batch_chunked(conn, rows, chunk_size, &sql)
 }
 
-fn fetch_merged_json_structure(conn: &Connection, table: &str) -> AppResult<String> {
-    let sql = format!("SELECT json_group_structure(payload) FROM {}", qident(table));
-    Ok(query_first_optional_string(conn, &sql)?.unwrap_or_else(|| "{}".to_string()))
-}
-
-fn materialize_nested_typed_table(
+fn ingest_json_batch_via_arrow(
     conn: &Connection,
-    raw_table: &str,
     typed_table: &str,
-    merged_structure: &str,
-) -> AppResult<()> {
+    rows: &[Value],
+    chunk_size: usize,
+) -> AppResult<String> {
+    let _ = infer_batch_shape(rows)?;
+    let incoming_structure = fetch_merged_json_structure_from_arrow_chunked(conn, rows, chunk_size)?;
+    let incoming_shape = shape_from_structure_json(&incoming_structure)?;
+
+    let merged_structure = if let Some(existing_structure) = fetch_table_row_structure_json(conn, typed_table)? {
+        let existing_shape = shape_from_structure_json(&existing_structure)?;
+        let mut merged_shape = existing_shape;
+        merge_json_shapes(&mut merged_shape, incoming_shape, "$").map_err(invalid_input)?;
+        serde_json::to_string(&shape_to_structure_json(&merged_shape))?
+    } else {
+        incoming_structure
+    };
+
+    ensure_arrow_table_function(conn)?;
+    let (arrow_union_source, params) = build_arrow_union_source_and_params(rows, chunk_size)?;
+    if arrow_union_source.is_empty() {
+        return Ok(merged_structure)
+    }
+
+    let table_q = qident(typed_table);
+    let source_sql = if fetch_table_row_structure_json(conn, typed_table)?.is_some() {
+        format!(
+            "SELECT CAST(to_json(t) AS VARCHAR) AS payload_text FROM {} t UNION ALL {}",
+            table_q,
+            arrow_union_source
+        )
+    } else {
+        arrow_union_source
+    };
+
     let sql = format!(
         "CREATE OR REPLACE TABLE {} AS
          SELECT parsed.*
-         FROM (SELECT from_json(payload, ?) AS parsed FROM {})",
-        qident(typed_table),
-        qident(raw_table)
+         FROM (
+             SELECT from_json(json(payload_text), {}) AS parsed
+             FROM ({})
+         )",
+        table_q,
+        qliteral(&merged_structure),
+        source_sql
     );
-    conn.execute(&sql, [merged_structure])?;
-    Ok(())
-}
-
-fn ingest_json_batch(
-    conn: &Connection,
-    raw_table: &str,
-    typed_table: &str,
-    rows: &[Value],
-) -> AppResult<String> {
-    let _ = infer_batch_shape(rows)?;
-    insert_raw_json_rows(conn, raw_table, rows)?;
-    let merged_structure = fetch_merged_json_structure(conn, raw_table)?;
-    materialize_nested_typed_table(conn, raw_table, typed_table, &merged_structure)?;
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.execute(params_from_iter(params))?;
     Ok(merged_structure)
 }
 
@@ -403,34 +470,14 @@ fn make_benchmark_rows(n: usize) -> Vec<Value> {
         .collect()
 }
 
-fn benchmark_arrow_vs_temp_table(conn: &Connection) -> AppResult<()> {
+fn benchmark_arrow_chunked_scan(conn: &Connection) -> AppResult<()> {
     let rows = make_benchmark_rows(10_000);
     let iterations = 20;
     let chunk_size = 1_000;
-    let bench_table = "bench_raw_events";
-    let bench_table_q = qident(bench_table);
-
-    conn.execute_batch(&format!(
-        "CREATE OR REPLACE TEMP TABLE {} (payload JSON)",
-        bench_table_q
-    ))?;
-    insert_raw_json_rows(conn, bench_table, &rows)?;
-    let merged_structure = fetch_merged_json_structure(conn, bench_table)?;
-    conn.execute_batch(&format!("DELETE FROM {}", bench_table_q))?;
-
-    let table_sql = format!(
-        "SELECT count(*)::BIGINT AS n, sum(parsed.user.score)::DOUBLE AS score_sum
-         FROM (SELECT from_json(payload, {}) AS parsed FROM {})",
-        qliteral(&merged_structure),
-        bench_table_q
-    );
-    let clear_sql = format!("DELETE FROM {}", bench_table_q);
+    let merged_structure = fetch_merged_json_structure_from_arrow_chunked(conn, &rows, chunk_size)?;
 
     ensure_arrow_table_function(conn)?;
     let _ = query_arrow_from_json_batch_chunked(conn, &rows, &merged_structure, chunk_size)?;
-    conn.execute_batch(&clear_sql)?;
-    insert_raw_json_rows(conn, bench_table, &rows)?;
-    let _: Vec<RecordBatch> = conn.prepare(&table_sql)?.query_arrow([])?.collect();
 
     let arrow_start = Instant::now();
     for _ in 0..iterations {
@@ -438,26 +485,12 @@ fn benchmark_arrow_vs_temp_table(conn: &Connection) -> AppResult<()> {
     }
     let arrow_elapsed = arrow_start.elapsed();
 
-    let temp_start = Instant::now();
-    for _ in 0..iterations {
-        conn.execute_batch(&clear_sql)?;
-        insert_raw_json_rows(conn, bench_table, &rows)?;
-        let _: Vec<RecordBatch> = conn.prepare(&table_sql)?.query_arrow([])?.collect();
-    }
-    let temp_elapsed = temp_start.elapsed();
-
     println!(
         "benchmark json->arrow(chunked)->scan: rows={} chunk_size={} total={:.2}ms avg={:.2}ms",
         rows.len(),
         chunk_size,
         arrow_elapsed.as_secs_f64() * 1000.0,
         arrow_elapsed.as_secs_f64() * 1000.0 / iterations as f64
-    );
-    println!(
-        "benchmark json->temp table(batched insert)->query: rows={} total={:.2}ms avg={:.2}ms",
-        rows.len(),
-        temp_elapsed.as_secs_f64() * 1000.0,
-        temp_elapsed.as_secs_f64() * 1000.0 / iterations as f64
     );
 
     Ok(())
@@ -473,13 +506,10 @@ fn debug_dump_table_row_structure(conn: &Connection, table: &str) -> AppResult<(
 
 fn main() -> AppResult<()> {
     let conn = Connection::open_in_memory()?;
-    let raw_table = "raw_events";
     let typed_table = "typed_events";
+    let chunk_size = 1_000;
 
-    conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE {} (payload JSON)",
-        qident(raw_table)
-    ))?;
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", qident(typed_table)))?;
 
     let batch1 = vec![
         json!({
@@ -493,7 +523,7 @@ fn main() -> AppResult<()> {
             "items": [{ "sku": "b", "qty": 3.0_f64 }]
         }),
     ];
-    let merged1 = ingest_json_batch(&conn, raw_table, typed_table, &batch1)?;
+    let merged1 = ingest_json_batch_via_arrow(&conn, typed_table, &batch1, chunk_size)?;
     println!("merged structure after batch1: {merged1}");
     let arrow_sql = format!(
         "SELECT parsed.*
@@ -514,12 +544,12 @@ fn main() -> AppResult<()> {
     ];
     let batch2_widens = validate_batch_against_existing_table(&conn, typed_table, &batch2)?;
     println!("batch2 compatible with existing typed table, widens schema: {batch2_widens}");
-    let merged2 = ingest_json_batch(&conn, raw_table, typed_table, &batch2)?;
+    let merged2 = ingest_json_batch_via_arrow(&conn, typed_table, &batch2, chunk_size)?;
     println!("merged structure after batch2: {merged2}");
 
     debug_dump_table_row_structure(&conn, typed_table)?;
     export_typed_table_to_parquet(&conn, typed_table, "target/nested_events.parquet")?;
-    benchmark_arrow_vs_temp_table(&conn)?;
+    benchmark_arrow_chunked_scan(&conn)?;
     Ok(())
 }
 
@@ -527,20 +557,13 @@ fn main() -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn setup_raw_events_table(conn: &Connection, raw_table: &str) {
-        conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {} (payload JSON)",
-            qident(raw_table)
-        ))
-        .expect("create raw table");
-    }
-
-    fn seed_typed_events(conn: &Connection, raw_table: &str, typed_table: &str) {
+    fn seed_typed_events(conn: &Connection, typed_table: &str) {
         let existing_batch = vec![json!({
             "event_id": "e1",
             "user": { "id": "u1", "score": 1_i64 }
         })];
-        ingest_json_batch(conn, raw_table, typed_table, &existing_batch).expect("ingest existing batch");
+        ingest_json_batch_via_arrow(conn, typed_table, &existing_batch, 1000)
+            .expect("ingest existing batch");
     }
 
     #[test]
@@ -568,10 +591,8 @@ mod tests {
     #[test]
     fn detects_widening_against_existing_table() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
-        let raw_table = "raw_events";
         let typed_table = "typed_events";
-        setup_raw_events_table(&conn, raw_table);
-        seed_typed_events(&conn, raw_table, typed_table);
+        seed_typed_events(&conn, typed_table);
 
         let incoming_batch = vec![json!({
             "event_id": "e2",
@@ -586,10 +607,8 @@ mod tests {
     #[test]
     fn detects_incompatibility_against_existing_table() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
-        let raw_table = "raw_events";
         let typed_table = "typed_events";
-        setup_raw_events_table(&conn, raw_table);
-        seed_typed_events(&conn, raw_table, typed_table);
+        seed_typed_events(&conn, typed_table);
 
         let incompatible_batch = vec![json!({
             "event_id": "e2",
@@ -628,8 +647,6 @@ mod tests {
     #[test]
     fn can_query_arrow_from_json_batch_chunked_in_one_query() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
-        let raw_table = "raw_events";
-        setup_raw_events_table(&conn, raw_table);
 
         let rows = vec![
             json!({"event_id": "e1", "value": 1_i64}),
@@ -638,8 +655,8 @@ mod tests {
             json!({"event_id": "e4", "value": 4_i64}),
             json!({"event_id": "e5", "value": 5_i64}),
         ];
-        insert_raw_json_rows(&conn, raw_table, &rows).expect("insert raw rows");
-        let merged_structure = fetch_merged_json_structure(&conn, raw_table).expect("merged structure");
+        let merged_structure = fetch_merged_json_structure_from_arrow_chunked(&conn, &rows, 2)
+            .expect("merged structure");
         let out = query_arrow_from_json_batch_chunked(&conn, &rows, &merged_structure, 2)
             .expect("query chunked arrow");
         let output_rows: usize = out.iter().map(RecordBatch::num_rows).sum();
