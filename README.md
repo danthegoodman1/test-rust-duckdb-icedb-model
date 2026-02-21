@@ -28,3 +28,14 @@ We’re trying to build a **Rust ingestion path using DuckDB** that behaves like
 ### Non-Goals
 - Not re-implementing full IceDB features (merge/tombstones/MVCC) here.
 - Focus is just dynamic in-memory ingest + schema evolution + fast append in Rust.
+
+### Perf Comparison (Current Prototype)
+- Ran with `cargo run --release` on this machine.
+- Dataset: `10,000` JSON rows per iteration.
+- Iterations: `20`.
+- Arrow path: chunked Arrow scan with one SQL query across chunks (`chunk_size=1000`).
+- Temp table path: batched multi-row JSON inserts (`VALUES ...` in chunks of `500`) then query.
+
+Results from the latest run:
+- `json -> arrow(chunked) -> scan`: total `441.60ms`, avg `22.08ms`
+- `json -> temp table(batched insert) -> query`: total `3972.95ms`, avg `198.65ms`

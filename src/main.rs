@@ -2,11 +2,13 @@ use duckdb::Connection;
 use duckdb::arrow::array::{ArrayRef, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::params_from_iter;
 use duckdb::vtab::arrow::ArrowVTab;
 use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 type AppResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -243,12 +245,19 @@ fn validate_batch_against_existing_table(
 }
 
 fn insert_raw_json_rows(conn: &Connection, table: &str, rows: &[Value]) -> AppResult<()> {
-    let sql = format!("INSERT INTO {} (payload) VALUES (json(?))", qident(table));
-    let mut stmt = conn.prepare(&sql)?;
-    for row in rows {
-        let payload = row.to_string();
-        stmt.execute([payload.as_str()])?;
+    const INSERT_CHUNK_ROWS: usize = 500;
+    let table_q = qident(table);
+
+    for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
+        let values = chunk
+            .iter()
+            .map(|row| format!("(json({}))", qliteral(&row.to_string())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO {} (payload) VALUES {}", table_q, values);
+        conn.execute_batch(&sql)?;
     }
+
     Ok(())
 }
 
@@ -259,12 +268,46 @@ fn json_rows_to_payload_record_batch(rows: &[Value]) -> AppResult<RecordBatch> {
     Ok(RecordBatch::try_new(schema, vec![payload_array])?)
 }
 
-fn ensure_arrow_table_function(conn: &Connection) -> AppResult<()> {
-    match conn.register_table_function::<ArrowVTab>("arrow") {
-        Ok(()) => Ok(()),
-        Err(err) if err.to_string().contains("already exists") => Ok(()),
-        Err(err) => Err(err.into()),
+fn run_arrow_query_from_json_batch(conn: &Connection, rows: &[Value], sql: &str) -> AppResult<Vec<RecordBatch>> {
+    let batch = json_rows_to_payload_record_batch(rows)?;
+    let params = arrow_recordbatch_to_query_params(batch);
+    let mut stmt = conn.prepare(sql)?;
+    Ok(stmt.query_arrow(params)?.collect())
+}
+
+fn run_arrow_query_from_json_batch_chunked(
+    conn: &Connection,
+    rows: &[Value],
+    chunk_size: usize,
+    sql_with_arrow_union_source: &str,
+) -> AppResult<Vec<RecordBatch>> {
+    if chunk_size == 0 {
+        return Err(invalid_input("chunk_size must be > 0").into())
     }
+
+    let mut params = Vec::<usize>::new();
+    for chunk in rows.chunks(chunk_size) {
+        let batch = json_rows_to_payload_record_batch(chunk)?;
+        let [array_ptr, schema_ptr] = arrow_recordbatch_to_query_params(batch);
+        params.push(array_ptr);
+        params.push(schema_ptr);
+    }
+
+    let mut stmt = conn.prepare(sql_with_arrow_union_source)?;
+    Ok(stmt.query_arrow(params_from_iter(params))?.collect())
+}
+
+fn ensure_arrow_table_function(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare(
+        "SELECT count(*)::BIGINT
+         FROM duckdb_functions()
+         WHERE function_name = 'arrow' AND function_type = 'table'"
+    )?;
+    let count: i64 = stmt.query_row([], |r| r.get(0))?;
+    if count == 0 {
+        conn.register_table_function::<ArrowVTab>("arrow")?;
+    }
+    Ok(())
 }
 
 fn query_arrow_from_json_batch(conn: &Connection, rows: &[Value], sql: &str) -> AppResult<Vec<RecordBatch>> {
@@ -273,10 +316,32 @@ fn query_arrow_from_json_batch(conn: &Connection, rows: &[Value], sql: &str) -> 
     // This still is not fully zero-copy from serde_json::Value because we
     // serialize rows into Arrow UTF8 payload strings and DuckDB parses JSON.
     ensure_arrow_table_function(conn)?;
-    let batch = json_rows_to_payload_record_batch(rows)?;
-    let params = arrow_recordbatch_to_query_params(batch);
-    let mut stmt = conn.prepare(sql)?;
-    Ok(stmt.query_arrow(params)?.collect())
+    run_arrow_query_from_json_batch(conn, rows, sql)
+}
+
+fn query_arrow_from_json_batch_chunked(
+    conn: &Connection,
+    rows: &[Value],
+    merged_structure: &str,
+    chunk_size: usize,
+) -> AppResult<Vec<RecordBatch>> {
+    ensure_arrow_table_function(conn)?;
+    let chunk_count = rows.chunks(chunk_size).len();
+    if chunk_count == 0 {
+        return Ok(vec![])
+    }
+
+    let union_source = (0..chunk_count)
+        .map(|_| "SELECT payload FROM arrow(?, ?)")
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!(
+        "SELECT parsed.*
+         FROM (SELECT from_json(json(payload), {}) AS parsed FROM ({}))",
+        qliteral(merged_structure),
+        union_source
+    );
+    run_arrow_query_from_json_batch_chunked(conn, rows, chunk_size, &sql)
 }
 
 fn fetch_merged_json_structure(conn: &Connection, table: &str) -> AppResult<String> {
@@ -322,6 +387,79 @@ fn export_typed_table_to_parquet(conn: &Connection, typed_table: &str, parquet_p
         qliteral(parquet_path)
     );
     conn.execute_batch(&copy_sql)?;
+    Ok(())
+}
+
+fn make_benchmark_rows(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            json!({
+                "event_id": format!("e{i}"),
+                "user": { "id": format!("u{i}"), "score": (i as f64) + 0.5_f64 },
+                "items": [{ "sku": format!("sku{i}"), "qty": ((i % 5) as f64) + 1.0_f64 }],
+                "meta": { "source": if i % 2 == 0 { "ad" } else { "organic" } }
+            })
+        })
+        .collect()
+}
+
+fn benchmark_arrow_vs_temp_table(conn: &Connection) -> AppResult<()> {
+    let rows = make_benchmark_rows(10_000);
+    let iterations = 20;
+    let chunk_size = 1_000;
+    let bench_table = "bench_raw_events";
+    let bench_table_q = qident(bench_table);
+
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TEMP TABLE {} (payload JSON)",
+        bench_table_q
+    ))?;
+    insert_raw_json_rows(conn, bench_table, &rows)?;
+    let merged_structure = fetch_merged_json_structure(conn, bench_table)?;
+    conn.execute_batch(&format!("DELETE FROM {}", bench_table_q))?;
+
+    let table_sql = format!(
+        "SELECT count(*)::BIGINT AS n, sum(parsed.user.score)::DOUBLE AS score_sum
+         FROM (SELECT from_json(payload, {}) AS parsed FROM {})",
+        qliteral(&merged_structure),
+        bench_table_q
+    );
+    let clear_sql = format!("DELETE FROM {}", bench_table_q);
+
+    ensure_arrow_table_function(conn)?;
+    let _ = query_arrow_from_json_batch_chunked(conn, &rows, &merged_structure, chunk_size)?;
+    conn.execute_batch(&clear_sql)?;
+    insert_raw_json_rows(conn, bench_table, &rows)?;
+    let _: Vec<RecordBatch> = conn.prepare(&table_sql)?.query_arrow([])?.collect();
+
+    let arrow_start = Instant::now();
+    for _ in 0..iterations {
+        let _ = query_arrow_from_json_batch_chunked(conn, &rows, &merged_structure, chunk_size)?;
+    }
+    let arrow_elapsed = arrow_start.elapsed();
+
+    let temp_start = Instant::now();
+    for _ in 0..iterations {
+        conn.execute_batch(&clear_sql)?;
+        insert_raw_json_rows(conn, bench_table, &rows)?;
+        let _: Vec<RecordBatch> = conn.prepare(&table_sql)?.query_arrow([])?.collect();
+    }
+    let temp_elapsed = temp_start.elapsed();
+
+    println!(
+        "benchmark json->arrow(chunked)->scan: rows={} chunk_size={} total={:.2}ms avg={:.2}ms",
+        rows.len(),
+        chunk_size,
+        arrow_elapsed.as_secs_f64() * 1000.0,
+        arrow_elapsed.as_secs_f64() * 1000.0 / iterations as f64
+    );
+    println!(
+        "benchmark json->temp table(batched insert)->query: rows={} total={:.2}ms avg={:.2}ms",
+        rows.len(),
+        temp_elapsed.as_secs_f64() * 1000.0,
+        temp_elapsed.as_secs_f64() * 1000.0 / iterations as f64
+    );
+
     Ok(())
 }
 
@@ -381,6 +519,7 @@ fn main() -> AppResult<()> {
 
     debug_dump_table_row_structure(&conn, typed_table)?;
     export_typed_table_to_parquet(&conn, typed_table, "target/nested_events.parquet")?;
+    benchmark_arrow_vs_temp_table(&conn)?;
     Ok(())
 }
 
@@ -484,5 +623,26 @@ mod tests {
         let out = query_arrow_from_json_batch(&conn, &rows, sql).expect("query arrow");
         assert_eq!(out.len(), 1, "expected one output batch");
         assert_eq!(out[0].num_rows(), 1, "expected one aggregate row");
+    }
+
+    #[test]
+    fn can_query_arrow_from_json_batch_chunked_in_one_query() {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        let raw_table = "raw_events";
+        setup_raw_events_table(&conn, raw_table);
+
+        let rows = vec![
+            json!({"event_id": "e1", "value": 1_i64}),
+            json!({"event_id": "e2", "value": 2_i64}),
+            json!({"event_id": "e3", "value": 3_i64}),
+            json!({"event_id": "e4", "value": 4_i64}),
+            json!({"event_id": "e5", "value": 5_i64}),
+        ];
+        insert_raw_json_rows(&conn, raw_table, &rows).expect("insert raw rows");
+        let merged_structure = fetch_merged_json_structure(&conn, raw_table).expect("merged structure");
+        let out = query_arrow_from_json_batch_chunked(&conn, &rows, &merged_structure, 2)
+            .expect("query chunked arrow");
+        let output_rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(output_rows, rows.len(), "expected all input rows in one query result");
     }
 }
