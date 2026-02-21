@@ -1,6 +1,12 @@
 use duckdb::Connection;
+use duckdb::arrow::array::{ArrayRef, StringArray};
+use duckdb::arrow::datatypes::{DataType, Field, Schema};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::vtab::arrow::ArrowVTab;
+use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 type AppResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -246,6 +252,33 @@ fn insert_raw_json_rows(conn: &Connection, table: &str, rows: &[Value]) -> AppRe
     Ok(())
 }
 
+fn json_rows_to_payload_record_batch(rows: &[Value]) -> AppResult<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, false)]));
+    let payloads: Vec<String> = rows.iter().map(Value::to_string).collect();
+    let payload_array: ArrayRef = Arc::new(StringArray::from(payloads));
+    Ok(RecordBatch::try_new(schema, vec![payload_array])?)
+}
+
+fn ensure_arrow_table_function(conn: &Connection) -> AppResult<()> {
+    match conn.register_table_function::<ArrowVTab>("arrow") {
+        Ok(()) => Ok(()),
+        Err(err) if err.to_string().contains("already exists") => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn query_arrow_from_json_batch(conn: &Connection, rows: &[Value], sql: &str) -> AppResult<Vec<RecordBatch>> {
+    // DuckDB can scan in-memory Arrow directly, which is usually cheaper than
+    // inserting JSON into a temporary table first and then scanning it.
+    // This still is not fully zero-copy from serde_json::Value because we
+    // serialize rows into Arrow UTF8 payload strings and DuckDB parses JSON.
+    ensure_arrow_table_function(conn)?;
+    let batch = json_rows_to_payload_record_batch(rows)?;
+    let params = arrow_recordbatch_to_query_params(batch);
+    let mut stmt = conn.prepare(sql)?;
+    Ok(stmt.query_arrow(params)?.collect())
+}
+
 fn fetch_merged_json_structure(conn: &Connection, table: &str) -> AppResult<String> {
     let sql = format!("SELECT json_group_structure(payload) FROM {}", qident(table));
     Ok(query_first_optional_string(conn, &sql)?.unwrap_or_else(|| "{}".to_string()))
@@ -324,6 +357,14 @@ fn main() -> AppResult<()> {
     ];
     let merged1 = ingest_json_batch(&conn, raw_table, typed_table, &batch1)?;
     println!("merged structure after batch1: {merged1}");
+    let arrow_sql = format!(
+        "SELECT parsed.*
+         FROM (SELECT from_json(json(payload), {}) AS parsed FROM arrow(?, ?))",
+        qliteral(&merged1)
+    );
+    let arrow_result = query_arrow_from_json_batch(&conn, &batch1, &arrow_sql)?;
+    let arrow_rows: usize = arrow_result.iter().map(RecordBatch::num_rows).sum();
+    println!("arrow query over batch1 rows: {arrow_rows}");
 
     let batch2 = vec![
         json!({
@@ -430,5 +471,18 @@ mod tests {
         let result = validate_batch_against_existing_table(&conn, "flags", &incoming_values);
 
         assert!(result.is_err(), "expected struct vs bool conflict");
+    }
+
+    #[test]
+    fn can_query_arrow_from_json_payload_batch() {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        let rows = vec![
+            json!({"event_id": "e1", "value": 1_i64}),
+            json!({"event_id": "e2", "value": 2_i64}),
+        ];
+        let sql = "SELECT count(*)::BIGINT AS c FROM arrow(?, ?)";
+        let out = query_arrow_from_json_batch(&conn, &rows, sql).expect("query arrow");
+        assert_eq!(out.len(), 1, "expected one output batch");
+        assert_eq!(out[0].num_rows(), 1, "expected one aggregate row");
     }
 }
